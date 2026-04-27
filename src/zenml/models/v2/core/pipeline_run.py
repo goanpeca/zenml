@@ -156,6 +156,16 @@ class PipelineRunRequest(ProjectScopedRequest):
         default=None,
         title="The original run ID for a replayed run.",
     )
+    parent_run_id: Optional[UUID] = Field(
+        default=None,
+        title="The parent run ID for a nested sub-pipeline run.",
+    )
+    child_key: Optional[str] = Field(
+        default=None,
+        title="Stable per-parent identifier of the sub-pipeline call that "
+        "produced this child run.",
+        max_length=STR_FIELD_MAX_LENGTH,
+    )
 
     @property
     def is_placeholder_request(self) -> bool:
@@ -189,6 +199,26 @@ class PipelineRunRequest(ProjectScopedRequest):
 
         return self
 
+    @model_validator(mode="after")
+    def _validate_parent_child_pair(self) -> "PipelineRunRequest":
+        """Ensure `parent_run_id` and `child_key` are set together.
+
+        The unique constraint on `(parent_run_id, child_key)` does not catch
+        cases where one is set and the other is `NULL` (NULLs compare unequal
+        in SQL), so resume idempotency would silently break.
+
+        Raises:
+            ValueError: If only one of the two fields is set.
+
+        Returns:
+            The pipeline run request.
+        """
+        if (self.parent_run_id is None) != (self.child_key is None):
+            raise ValueError(
+                "`parent_run_id` and `child_key` must be set together."
+            )
+        return self
+
     model_config = ConfigDict(protected_namespaces=())
 
 
@@ -208,6 +238,10 @@ class PipelineRunUpdate(BaseUpdate):
     exception_info: Optional[ExceptionInfo] = Field(
         default=None,
         title="The exception information of the pipeline run.",
+    )
+    outputs: Optional[Dict[str, UUID]] = Field(
+        default=None,
+        title="Pipeline output artifact version IDs keyed by output name.",
     )
     # TODO: we should maybe have a different update model here, the upper
     #  attributes should only be for internal use
@@ -246,6 +280,16 @@ class PipelineRunResponseBody(ProjectScopedResponseBody):
     pipeline_id: UUID | None = Field(
         default=None,
         title="The ID of the pipeline this run is associated with.",
+    )
+    child_key: Optional[str] = Field(
+        default=None,
+        title="Stable per-parent identifier of the sub-pipeline call that "
+        "produced this child run.",
+        max_length=STR_FIELD_MAX_LENGTH,
+    )
+    root_run_id: Optional[UUID] = Field(
+        default=None,
+        title="The ID of the top-level parent run of this run's nesting tree.",
     )
 
     model_config = ConfigDict(protected_namespaces=())
@@ -365,9 +409,17 @@ class PipelineRunResponseResources(ProjectScopedResponseResources):
         default=None,
         title="The original run that was replayed to create this run.",
     )
+    parent_run: Optional["PipelineRunResponse"] = Field(
+        default=None,
+        title="The parent run that launched this run as a sub-pipeline.",
+    )
     active_wait_condition: Optional["RunWaitConditionResponse"] = Field(
         default=None,
         title="The active pending wait condition associated with this run.",
+    )
+    outputs: Dict[str, "ArtifactVersionResponse"] = Field(
+        default_factory=dict,
+        title="Pipeline output artifact versions keyed by output name.",
     )
 
     # TODO: In Pydantic v2, the `model_` is a protected namespaces for all
@@ -715,6 +767,15 @@ class PipelineRunResponse(
         return self.get_metadata().trigger_execution_info
 
     @property
+    def outputs(self) -> Dict[str, "ArtifactVersionResponse"]:
+        """The `outputs` property.
+
+        Returns:
+            The output artifact versions keyed by output name.
+        """
+        return self.get_resources().outputs
+
+    @property
     def original_run(self) -> Optional["PipelineRunResponse"]:
         """The `original_run` property.
 
@@ -722,6 +783,15 @@ class PipelineRunResponse(
             the value of the property.
         """
         return self.get_resources().original_run
+
+    @property
+    def parent_run(self) -> Optional["PipelineRunResponse"]:
+        """The `parent_run` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_resources().parent_run
 
     @property
     def active_wait_condition(self) -> Optional["RunWaitConditionResponse"]:
@@ -740,6 +810,24 @@ class PipelineRunResponse(
             The ID of the pipeline this run is associated with.
         """
         return self.get_body().pipeline_id
+
+    @property
+    def child_key(self) -> Optional[str]:
+        """The `child_key` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_body().child_key
+
+    @property
+    def root_run_id(self) -> Optional[UUID]:
+        """The `root_run_id` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_body().root_run_id
 
 
 # ------------------ Filter Model ------------------
@@ -918,6 +1006,11 @@ class PipelineRunFilter(
     trigger_id: UUID | str | None = Field(
         default=None,
         description="The ID of the trigger that generated this pipeline run.",
+        union_mode="left_to_right",
+    )
+    parent_run_id: Optional[Union[UUID, str]] = Field(
+        default=None,
+        description="The parent run ID for nested sub-pipeline runs.",
         union_mode="left_to_right",
     )
     model_config = ConfigDict(protected_namespaces=())

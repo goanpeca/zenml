@@ -15,15 +15,28 @@
 
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Collection, Dict, List, Optional, Sequence, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Collection,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Union,
+)
 
 from zenml.config.step_configurations import StepConfigurationUpdate
-from zenml.execution.pipeline.dynamic.outputs import AnyStepFuture
+from zenml.execution.pipeline.dynamic.outputs import AnyOutputFuture
 from zenml.logger import get_logger
 from zenml.steps import BaseStep
 from zenml.utils.enum_utils import StrEnum
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from zenml.pipelines.dynamic.pipeline_definition import DynamicPipeline
 
 
 class NodeState(StrEnum):
@@ -75,7 +88,7 @@ class StepNode(BaseNode):
     parent_id: Optional[str] = None
     step: Optional[BaseStep] = None
     inputs: Optional[Dict[str, Any]] = None
-    after: Optional[Union[AnyStepFuture, Sequence[AnyStepFuture]]] = None
+    after: Optional[Union[AnyOutputFuture, Sequence[AnyOutputFuture]]] = None
     config_overrides: Optional["StepConfigurationUpdate"] = None
 
 
@@ -86,11 +99,20 @@ class MapNode(BaseNode):
     child_node_ids: Set[str] = field(default_factory=set)
     step: BaseStep
     inputs: Dict[str, Any]
-    after: Union[AnyStepFuture, Sequence[AnyStepFuture], None]
+    after: Union[AnyOutputFuture, Sequence[AnyOutputFuture], None]
     product: bool
 
 
-AnyNode = Union[StepNode, MapNode]
+@dataclass(kw_only=True)
+class SubPipelineNode(BaseNode):
+    """Sub-pipeline graph node."""
+
+    pipeline: "DynamicPipeline"
+    args: Sequence[Any] = field(default_factory=tuple)
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+AnyNode = Union[StepNode, MapNode, SubPipelineNode]
 
 
 class InvocationDependencyGraph:
@@ -108,7 +130,9 @@ class InvocationDependencyGraph:
         state: Optional[NodeState] = None,
         step: Optional[BaseStep] = None,
         inputs: Optional[Dict[str, Any]] = None,
-        after: Optional[Union[AnyStepFuture, Sequence[AnyStepFuture]]] = None,
+        after: Optional[
+            Union[AnyOutputFuture, Sequence[AnyOutputFuture]]
+        ] = None,
         config_overrides: Optional["StepConfigurationUpdate"] = None,
     ) -> bool:
         """Register a step node.
@@ -143,7 +167,9 @@ class InvocationDependencyGraph:
         product: bool,
         upstream_ids: Optional[Sequence[str]] = None,
         state: Optional[NodeState] = None,
-        after: Optional[Union[AnyStepFuture, Sequence[AnyStepFuture]]] = None,
+        after: Optional[
+            Union[AnyOutputFuture, Sequence[AnyOutputFuture]]
+        ] = None,
     ) -> bool:
         """Register a map aggregate node.
 
@@ -166,6 +192,37 @@ class InvocationDependencyGraph:
             inputs=inputs,
             after=after,
             product=product,
+        )
+        return self._register_node(node=node, upstream_ids=upstream_ids)
+
+    def register_subpipeline_node(
+        self,
+        node_id: str,
+        pipeline: "DynamicPipeline",
+        args: Optional[Sequence[Any]] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+        upstream_ids: Optional[Sequence[str]] = None,
+        state: Optional[NodeState] = None,
+    ) -> bool:
+        """Register a sub-pipeline node.
+
+        Args:
+            node_id: The node ID.
+            pipeline: The child pipeline payload for startup.
+            args: Optional positional payload for startup.
+            kwargs: Optional keyword payload for startup.
+            upstream_ids: Optional upstream node IDs.
+            state: Optional initial state for the node.
+
+        Returns:
+            Whether the registration caused any newly ready nodes.
+        """
+        node = SubPipelineNode(
+            node_id=node_id,
+            state=state or NodeState.PENDING,
+            pipeline=pipeline,
+            args=args or (),
+            kwargs=kwargs or {},
         )
         return self._register_node(node=node, upstream_ids=upstream_ids)
 
@@ -203,6 +260,27 @@ class InvocationDependencyGraph:
             node = self._get_node(node_id=node_id)
             if not isinstance(node, MapNode):
                 raise RuntimeError(f"Node `{node_id}` is not a map node.")
+            return node
+
+    def get_subpipeline_node(self, node_id: str) -> SubPipelineNode:
+        """Get a sub-pipeline node by ID.
+
+        Args:
+            node_id: The node ID.
+
+        Raises:
+            RuntimeError: If the node does not exist or is not a sub-pipeline
+                node.
+
+        Returns:
+            The sub-pipeline node.
+        """
+        with self._lock:
+            node = self._get_node(node_id=node_id)
+            if not isinstance(node, SubPipelineNode):
+                raise RuntimeError(
+                    f"Node `{node_id}` is not a sub-pipeline node."
+                )
             return node
 
     def attach_map_children(
@@ -263,22 +341,28 @@ class InvocationDependencyGraph:
     def get_ready_node(self) -> Optional[AnyNode]:
         """Get one ready node in insertion order.
 
-        Step nodes are prioritized over map nodes.
+        Step nodes are prioritized over sub-pipeline nodes over map nodes.
 
         Returns:
             A ready node if one exists, otherwise `None`.
         """
         with self._lock:
+            ready_subpipeline_node: Optional[SubPipelineNode] = None
             ready_map_node: Optional[MapNode] = None
             for node in self._nodes.values():
                 if node.state != NodeState.READY:
                     continue
                 if isinstance(node, StepNode):
                     return node
+                if (
+                    isinstance(node, SubPipelineNode)
+                    and ready_subpipeline_node is None
+                ):
+                    ready_subpipeline_node = node
                 if isinstance(node, MapNode) and ready_map_node is None:
                     ready_map_node = node
 
-            return ready_map_node
+            return ready_subpipeline_node or ready_map_node
 
     def mark_node_starting(self, node_id: str) -> bool:
         """Mark a node as starting.

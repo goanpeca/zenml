@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Union
 
 from zenml.execution.pipeline.dynamic.outputs import (
     MapResultsFuture,
+    PipelineFuture,
     StepExecutionFuture,
     StepFuture,
 )
@@ -39,6 +40,7 @@ class FutureRegistry:
         self._lock = threading.RLock()
         self._step_futures: Dict[str, StepFuture] = {}
         self._map_futures: Dict[str, MapResultsFuture] = {}
+        self._pipeline_futures: Dict[str, PipelineFuture] = {}
 
     def register_step_future(
         self,
@@ -126,6 +128,49 @@ class FutureRegistry:
                 raise KeyError(f"Unknown map future `{map_id}`.")
             return future
 
+    def register_pipeline_future(
+        self, node_id: str, future: PipelineFuture
+    ) -> PipelineFuture:
+        """Register a sub-pipeline future.
+
+        Args:
+            node_id: Dependency-graph node ID of the sub-pipeline call (e.g.
+                `pipeline:<name>`), not a pipeline run UUID.
+            future: The pipeline future.
+
+        Raises:
+            RuntimeError: If a future already exists for the node.
+
+        Returns:
+            The registered pipeline future.
+        """
+        with self._lock:
+            if node_id in self._pipeline_futures:
+                raise RuntimeError(
+                    f"Pipeline future for node `{node_id}` already exists."
+                )
+
+            self._pipeline_futures[node_id] = future
+            return future
+
+    def get_pipeline_future(self, node_id: str) -> PipelineFuture:
+        """Get a sub-pipeline future.
+
+        Args:
+            node_id: Dependency-graph node ID of the sub-pipeline call.
+
+        Raises:
+            KeyError: If the future does not exist.
+
+        Returns:
+            The pipeline future.
+        """
+        with self._lock:
+            future = self._pipeline_futures.get(node_id)
+            if future is None:
+                raise KeyError(f"Unknown pipeline future `{node_id}`.")
+            return future
+
     def bind_step_execution_future(
         self, invocation_id: str, future: StepExecutionFuture
     ) -> None:
@@ -176,7 +221,22 @@ class FutureRegistry:
             future = self.get_map_future(map_id=map_id)
             future._set_startup_failed(exception)
 
-    def get_all_futures(self) -> List[Union[StepFuture, MapResultsFuture]]:
+    def fail_pipeline_startup(
+        self, node_id: str, exception: BaseException
+    ) -> None:
+        """Store a startup failure for a sub-pipeline.
+
+        Args:
+            node_id: Dependency-graph node ID of the sub-pipeline call.
+            exception: The startup exception.
+        """
+        with self._lock:
+            pipeline_future = self.get_pipeline_future(node_id=node_id)
+            pipeline_future._set_startup_failed(exception)
+
+    def get_all_futures(
+        self,
+    ) -> List[Union[StepFuture, MapResultsFuture, PipelineFuture]]:
         """Return all tracked futures.
 
         Returns:
@@ -186,6 +246,7 @@ class FutureRegistry:
             return [
                 *self._step_futures.values(),
                 *self._map_futures.values(),
+                *self._pipeline_futures.values(),
             ]
 
     def await_all_no_raise(self) -> None:
@@ -263,3 +324,22 @@ class FutureRegistry:
         with self._lock:
             map_future = self.get_map_future(map_id=map_id)
             map_future._cancel_startup(exception)
+
+    def cancel_pipeline_startup(
+        self,
+        node_id: str,
+        exception: Optional[StartupCancelled] = None,
+    ) -> None:
+        """Cancel startup for a specific sub-pipeline.
+
+        Args:
+            node_id: Dependency-graph node ID of the sub-pipeline call.
+            exception: Optional exception to set on the future. If not
+                provided, a generic cancellation exception is used.
+        """
+        exception = exception or StartupCancelled(
+            f"Startup for sub-pipeline `{node_id}` was cancelled."
+        )
+        with self._lock:
+            pipeline_future = self.get_pipeline_future(node_id=node_id)
+            pipeline_future._cancel_startup(exception)

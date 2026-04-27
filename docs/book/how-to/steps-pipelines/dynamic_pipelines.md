@@ -287,6 +287,102 @@ The `StepRunFuture` object provides several methods:
 When using `step.submit()`, steps with `runtime="isolated"` will execute in separate containers/processes, while steps with `runtime="inline"` will execute in separate threads within the orchestration environment.
 {% endhint %}
 
+### Sub-pipelines inside dynamic pipelines
+
+Dynamic pipelines can call other dynamic pipelines from their `@pipeline`
+body. This is useful for composing larger workflows out of reusable dynamic
+building blocks.
+
+Key behavior:
+
+- Only dynamic pipelines can be called as sub-pipelines.
+- Sub-pipelines run on the same stack as the parent run.
+- Sub-pipelines can run synchronously (`child(...)`) or concurrently
+  (`child.submit(...)`).
+- Sub-pipeline calls are only allowed in pipeline bodies, not inside step
+  functions.
+- Sub-pipelines reuse the parent run's Docker image — they don't trigger a
+  new build. The child snapshot inherits the parent's build, code reference,
+  and code path so the child runs against the exact same image and source
+  bundle as the parent.
+
+Sub-pipeline outputs are returned as artifact references:
+
+- `None`
+- A single output artifact
+- A tuple of output artifacts
+
+These outputs can be passed directly to downstream steps.
+
+```python
+from zenml import pipeline, step
+
+@step
+def produce_number() -> int:
+    return 42
+
+@pipeline(dynamic=True)
+def child_pipeline():
+    return produce_number()
+
+@step
+def consume_number(value: int) -> None:
+    print(value)
+
+@pipeline(dynamic=True)
+def parent_pipeline():
+    child_output = child_pipeline()
+    consume_number(child_output)
+```
+
+For concurrent execution, use `submit()` and wait on the future:
+
+```python
+@pipeline(dynamic=True)
+def parent_pipeline_concurrent():
+    future = child_pipeline.submit()
+    child_output = future.result()
+    consume_number(child_output)
+```
+
+### Inline sub-pipelines with `inline_in_parent_run(...)`
+
+Use `child_pipeline.inline_in_parent_run(...)` if you want to reuse another
+dynamic pipeline's body without creating a child pipeline run.
+
+```python
+@pipeline(dynamic=True)
+def parent_pipeline_inline():
+    # Executes child steps in the parent run context
+    child_output = child_pipeline.inline_in_parent_run()
+    consume_number(child_output)
+```
+
+`inline_in_parent_run(...)` behavior:
+
+- It executes the child pipeline entrypoint inline as part of the parent run.
+- It does not create a separate child run in the dashboard.
+- It is only valid inside a dynamic pipeline body.
+- It is not allowed inside `@step` functions.
+
+In short, use:
+
+- `child_pipeline(...)` for a synchronous child run
+- `child_pipeline.submit(...)` for a concurrent child run
+- `child_pipeline.inline_in_parent_run(...)` for inline execution in the parent
+  run
+
+{% hint style="warning" %}
+**Resume idempotency depends on submit order.** Sub-pipeline child runs are
+identified by the order of `child_pipeline(...)` / `child_pipeline.submit(...)`
+calls in the parent body: the first call to `my_pipeline` becomes
+`pipeline:my_pipeline`, the second becomes `pipeline:my_pipeline_2`, and so on.
+On resume, ZenML reuses an existing child run only if the same call appears in
+the same position. If you reorder, insert, or remove sub-pipeline calls before
+existing ones, every subsequent ID shifts and previously completed children are
+re-executed. Same caveat applies to step invocation IDs.
+{% endhint %}
+
 ### Config Templates with `depends_on`
 
 You can use YAML configuration files to provide default parameters for steps using the `depends_on` parameter:
